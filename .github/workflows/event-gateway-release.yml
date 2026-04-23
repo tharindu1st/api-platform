@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 env:
-  DOCKER_REGISTRY: ghcr.io/wso2/api-platform
+  DOCKER_REGISTRY: ghcr.io/tharindu1st/api-platform
 
 jobs:
   release:
@@ -90,7 +90,6 @@ jobs:
           branch: version-bump-${{ github.run_id }}
           base: main
           delete-branch: true
-          assignees: renuka-fernando
           labels: |
             automated
             version-bump

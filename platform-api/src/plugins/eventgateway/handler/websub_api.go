@@ -30,20 +30,20 @@ import (
 	"platform-api/src/api"
 	"platform-api/src/internal/constants"
 	"platform-api/src/internal/middleware"
-	"platform-api/src/internal/service"
 	"platform-api/src/internal/utils"
+	egservice "platform-api/src/plugins/eventgateway/service"
 
 	"github.com/wso2/go-httpkit/httputil"
 )
 
 // WebSubAPIHandler handles CRUD and auxiliary routes for WebSub APIs
 type WebSubAPIHandler struct {
-	websubAPIService *service.WebSubAPIService
+	websubAPIService *egservice.WebSubAPIService
 	slogger          *slog.Logger
 }
 
 // NewWebSubAPIHandler creates a new WebSubAPIHandler instance
-func NewWebSubAPIHandler(websubAPIService *service.WebSubAPIService, slogger *slog.Logger) *WebSubAPIHandler {
+func NewWebSubAPIHandler(websubAPIService *egservice.WebSubAPIService, slogger *slog.Logger) *WebSubAPIHandler {
 	return &WebSubAPIHandler{
 		websubAPIService: websubAPIService,
 		slogger:          slogger,

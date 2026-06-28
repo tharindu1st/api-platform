@@ -30,20 +30,20 @@ import (
 	"platform-api/src/api"
 	"platform-api/src/internal/constants"
 	"platform-api/src/internal/middleware"
-	"platform-api/src/internal/service"
 	"platform-api/src/internal/utils"
+	egservice "platform-api/src/plugins/eventgateway/service"
 
 	"github.com/wso2/go-httpkit/httputil"
 )
 
 // WebBrokerAPIHandler handles CRUD and auxiliary routes for WebBroker APIs
 type WebBrokerAPIHandler struct {
-	webbrokerAPIService *service.WebBrokerAPIService
+	webbrokerAPIService *egservice.WebBrokerAPIService
 	slogger             *slog.Logger
 }
 
 // NewWebBrokerAPIHandler creates a new WebBrokerAPIHandler instance
-func NewWebBrokerAPIHandler(webbrokerAPIService *service.WebBrokerAPIService, slogger *slog.Logger) *WebBrokerAPIHandler {
+func NewWebBrokerAPIHandler(webbrokerAPIService *egservice.WebBrokerAPIService, slogger *slog.Logger) *WebBrokerAPIHandler {
 	return &WebBrokerAPIHandler{
 		webbrokerAPIService: webbrokerAPIService,
 		slogger:             slogger,

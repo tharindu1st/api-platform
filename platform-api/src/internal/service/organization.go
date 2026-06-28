@@ -55,7 +55,6 @@ func NewOrganizationService(orgRepo repository.OrganizationRepository,
 	llmProviderRepo repository.LLMProviderRepository,
 	llmProxyRepo repository.LLMProxyRepository,
 	mcpProxyRepo repository.MCPProxyRepository,
-	websubAPIRepo repository.WebSubAPIRepository,
 	llmTemplateSeeder *LLMTemplateSeeder,
 	auditRepo repository.AuditRepository,
 	cfg *config.Server,
@@ -70,12 +69,17 @@ func NewOrganizationService(orgRepo repository.OrganizationRepository,
 		llmProviderRepo:   llmProviderRepo,
 		llmProxyRepo:      llmProxyRepo,
 		mcpProxyRepo:      mcpProxyRepo,
-		websubAPIRepo:     websubAPIRepo,
 		llmTemplateSeeder: llmTemplateSeeder,
 		auditRepo:         auditRepo,
 		config:            cfg,
 		slogger:           slogger,
 	}
+}
+
+// SetWebSubAPIRepo wires in the WebSub API repository. Called by the server
+// after an EventArtifactPlugin has been initialized (experimental builds only).
+func (s *OrganizationService) SetWebSubAPIRepo(repo repository.WebSubAPIRepository) {
+	s.websubAPIRepo = repo
 }
 
 func (s *OrganizationService) GetOrganizationSubscription(orgID string) (*api.OrganizationSubscription, error) {
@@ -103,9 +107,12 @@ func (s *OrganizationService) GetOrganizationSubscription(orgID string) (*api.Or
 		return nil, err
 	}
 
-	websubAPICount, err := s.websubAPIRepo.Count(orgID)
-	if err != nil {
-		return nil, err
+	var websubAPICount int
+	if s.websubAPIRepo != nil {
+		websubAPICount, err = s.websubAPIRepo.Count(orgID)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	gateways, err := s.gatewayRepo.GetByOrganizationID(orgID)

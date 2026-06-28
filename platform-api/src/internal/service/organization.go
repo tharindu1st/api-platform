@@ -31,20 +31,26 @@ import (
 	openapi_types "github.com/oapi-codegen/runtime/types"
 )
 
+// OrgSubscriptionEnricher is implemented by plugins that contribute quota
+// counts to the organization subscription response.
+type OrgSubscriptionEnricher interface {
+	EnrichSubscription(orgID string, sub *api.OrganizationSubscription) error
+}
+
 type OrganizationService struct {
-	orgRepo           repository.OrganizationRepository
-	projectRepo       repository.ProjectRepository
-	applicationRepo   repository.ApplicationRepository
-	apiRepo           repository.APIRepository
-	gatewayRepo       repository.GatewayRepository
-	llmProviderRepo   repository.LLMProviderRepository
-	llmProxyRepo      repository.LLMProxyRepository
-	mcpProxyRepo      repository.MCPProxyRepository
-	websubAPIRepo     repository.WebSubAPIRepository
-	llmTemplateSeeder *LLMTemplateSeeder
-	auditRepo         repository.AuditRepository
-	config            *config.Server
-	slogger           *slog.Logger
+	orgRepo                 repository.OrganizationRepository
+	projectRepo             repository.ProjectRepository
+	applicationRepo         repository.ApplicationRepository
+	apiRepo                 repository.APIRepository
+	gatewayRepo             repository.GatewayRepository
+	llmProviderRepo         repository.LLMProviderRepository
+	llmProxyRepo            repository.LLMProxyRepository
+	mcpProxyRepo            repository.MCPProxyRepository
+	subscriptionEnrichers   []OrgSubscriptionEnricher
+	llmTemplateSeeder       *LLMTemplateSeeder
+	auditRepo               repository.AuditRepository
+	config                  *config.Server
+	slogger                 *slog.Logger
 }
 
 func NewOrganizationService(orgRepo repository.OrganizationRepository,
@@ -76,10 +82,10 @@ func NewOrganizationService(orgRepo repository.OrganizationRepository,
 	}
 }
 
-// SetWebSubAPIRepo wires in the WebSub API repository. Called by the server
-// after an EventArtifactPlugin has been initialized (experimental builds only).
-func (s *OrganizationService) SetWebSubAPIRepo(repo repository.WebSubAPIRepository) {
-	s.websubAPIRepo = repo
+// RegisterSubscriptionEnricher adds an enricher that contributes quota data
+// to the organization subscription response. Plugins call this during wiring.
+func (s *OrganizationService) RegisterSubscriptionEnricher(enricher OrgSubscriptionEnricher) {
+	s.subscriptionEnrichers = append(s.subscriptionEnrichers, enricher)
 }
 
 func (s *OrganizationService) GetOrganizationSubscription(orgID string) (*api.OrganizationSubscription, error) {
@@ -107,14 +113,6 @@ func (s *OrganizationService) GetOrganizationSubscription(orgID string) (*api.Or
 		return nil, err
 	}
 
-	var websubAPICount int
-	if s.websubAPIRepo != nil {
-		websubAPICount, err = s.websubAPIRepo.Count(orgID)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	gateways, err := s.gatewayRepo.GetByOrganizationID(orgID)
 	if err != nil {
 		return nil, err
@@ -133,9 +131,6 @@ func (s *OrganizationService) GetOrganizationSubscription(orgID string) (*api.Or
 
 	mcpProxiesLimit := constants.MaxMCPProxiesPerOrganization
 	mcpProxiesRemaining := max(mcpProxiesLimit-mcpProxiesCount, 0)
-
-	websubAPIsLimit := constants.MaxWebSubAPIsPerOrganization
-	websubAPIsRemaining := max(websubAPIsLimit-websubAPICount, 0)
 
 	res := &api.OrganizationSubscription{
 		Plan: "free",
@@ -164,12 +159,13 @@ func (s *OrganizationService) GetOrganizationSubscription(orgID string) (*api.Or
 			Apis: api.OrganizationQuota{
 				Used: len(apis),
 			},
-			WebsubApis: &api.OrganizationQuota{
-				Used:      websubAPICount,
-				Limit:     intPtr(websubAPIsLimit),
-				Remaining: intPtr(websubAPIsRemaining),
-			},
 		},
+	}
+
+	for _, enricher := range s.subscriptionEnrichers {
+		if err := enricher.EnrichSubscription(orgID, res); err != nil {
+			return nil, err
+		}
 	}
 
 	return res, nil

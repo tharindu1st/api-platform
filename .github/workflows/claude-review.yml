@@ -6,10 +6,10 @@ on:
 
 # Ensure the runner has permissions to read code and post comments
 permissions:
+  id-token: write
   contents: read
   pull-requests: write
   issues: write
-
 jobs:
   review:
     runs-on: ubuntu-latest

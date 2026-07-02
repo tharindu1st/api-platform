@@ -24,4 +24,7 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
-            Review the changes according to available rules and skills.
+              REPO: ${{ github.repository }}
+              PR NUMBER: ${{ github.event.pull_request.number }}
+              Please review this pull request with a focus on:
+              Available skills and rules and best practices.

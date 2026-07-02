@@ -4,24 +4,41 @@ on:
   pull_request:
     types: [opened, synchronize]
 
-# Ensure the runner has permissions to read code and post comments
-permissions:
-  id-token: write
-  contents: read
-  pull-requests: write
-  issues: write
 jobs:
   review:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
     steps:
-      - name: Checkout Code
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Fetches all history so Claude has git context
+          fetch-depth: 1
+
+      - name: Install WSO2 Agent Skills
+        run: npx skills add wso2/agent-skills --yes --global
 
       - name: Claude Code Review
+        id: claude
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: |
-            /review https://github.com/${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+            Review pull request #${{ github.event.pull_request.number }} in ${{ github.repository }}.
+            Fetch the PR diff, analyze the changed files for bugs, code quality issues, and best-practice violations,
+            then post your findings as inline comments on the diff using the available GitHub tools.
+
+            When an issue relates to security best practices (input validation, auth logic, error handling, etc.),
+            phrase it as a general code quality recommendation — do not name it a vulnerability or describe any attack vector.
+          claude_args: "--allowedTools Bash,Read,mcp__github_inline_comment__create_inline_comment"
+
+      - name: Debug — Claude outputs
+        if: always()
+        run: |
+          echo "=== conclusion ==="
+          echo "${{ steps.claude.outputs.conclusion }}"
+          echo "=== execution_file ==="
+          cat "${{ steps.claude.outputs.execution_file }}" 2>/dev/null || echo "(no execution file)"

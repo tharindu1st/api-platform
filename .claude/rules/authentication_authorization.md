@@ -728,3 +728,579 @@ func LoginCallbackHandler(w http.ResponseWriter, r *http.Request) {
 > * Is a redirect target validated with a substring/prefix check (`strings.Contains`, `strings.HasPrefix`) rather than a parsed-URL host comparison against an explicit allowlist? (Substring checks are bypassable — replace with `url.Parse` + exact host match.)
 > * Does the validated redirect target allow scheme-relative URLs (`//attacker.com`) or a userinfo trick (`https://trusted.com@attacker.com`)? (Both parse as "same host" under naive checks — `safeRedirectTarget`-style explicit host comparison closes both.)
 > * On rejection, does the handler redirect to a safe default rather than erroring in a way that reflects the rejected URL back into the response? (Reflecting it back risks reintroducing an XSS surface — see `js-output-encoding-xss.md` for the same principle in JS.)
+
+---
+
+## GO-AUTH-011: Fail-Closed Startup Validation for Security-Critical Configuration
+
+### Severity
+
+Critical
+
+### Description
+
+At startup, validate that the *resulting* security configuration is actually enforceable, not merely that each field in isolation is well-formed. If authentication is nominally "enabled" but no authenticator can actually be constructed from the given config (e.g. basic-auth enabled with zero registered users), or a control-plane channel is configured to run without TLS, the process must refuse to start — or, in an explicitly-flagged development mode only, fail loudly on every request — rather than silently falling back to an open/passthrough state.
+
+### Rationale
+
+A real incident: a basic-auth block with `enabled: true` and an empty `users` list caused the authenticator registry to register zero authenticators; the middleware's own "zero authenticators registered" branch then treated every request as `Authenticated: true` with authorization skipped, and the one warning that could have caught this only fired when *both* basic and IDP auth were disabled — a config that has "some auth enabled" was never checked for whether that auth actually does anything.
+
+### Non-Compliant Code
+
+```go
+// ERROR: registers an authenticator only if BasicAuth.Enabled && len(Users) > 0.
+// If Enabled is true but Users is empty, zero authenticators are registered —
+// and the code silently treats that as "no auth needed" rather than "misconfigured."
+func BuildAuthenticators(cfg AuthConfig) []Authenticator {
+    var authns []Authenticator
+    if cfg.BasicAuth.Enabled && len(cfg.BasicAuth.Users) > 0 {
+        authns = append(authns, NewBasicAuthenticator(cfg.BasicAuth.Users))
+    }
+    return authns // Can be empty even though BasicAuth.Enabled == true
+}
+
+func AuthMiddleware(authns []Authenticator) func(http.Handler) http.Handler {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            if len(authns) == 0 {
+                // ERROR: passthrough — every request is treated as authenticated.
+                ctx := context.WithValue(r.Context(), AuthContextKey, AuthContext{
+                    Authenticated: true, UserID: "sys_noauth_user",
+                })
+                ctx = context.WithValue(ctx, AuthzSkipKey, true)
+                next.ServeHTTP(w, r.WithContext(ctx))
+                return
+            }
+            // ... real check
+        })
+    }
+}
+```
+
+### Compliant Code
+
+```go
+// CORRECT: startup validation checks the *effective* result of the config,
+// not just each field — refuses to start rather than silently degrading.
+func ValidateAuthConfig(cfg AuthConfig) error {
+    if cfg.BasicAuth.Enabled && len(cfg.BasicAuth.Users) == 0 {
+        return fmt.Errorf("basic auth is enabled but no users are configured — " +
+            "refusing to start with an unenforceable auth config")
+    }
+    if !cfg.BasicAuth.Enabled && !cfg.IDP.Enabled {
+        return fmt.Errorf("no authentication method is configured — " +
+            "set auth.disable=true explicitly if this is intentional")
+    }
+    return nil
+}
+
+func main() {
+    cfg := loadConfig()
+    if err := ValidateAuthConfig(cfg.Auth); err != nil {
+        log.Fatalf("fatal: invalid auth configuration: %v", err) // Refuse to start
+    }
+    // ...
+}
+
+// An explicit, off-by-default opt-out — never an implicit fallback.
+type AuthConfig struct {
+    Disable   bool // Must be explicitly set; logs a startup banner-level warning on every request when true
+    BasicAuth BasicAuthConfig
+    IDP       IDPConfig
+}
+```
+
+> **Verification Checklist before outputting code:**
+> * Can any combination of "enabled" flags and empty sub-config (e.g. an empty `users` list) result in zero authenticators being registered while auth is still nominally "enabled"? (If yes, add a startup check that fails closed on this combination specifically, not just on `Enabled == false`.)
+> * Does the existing "no authentication configured" warning check the *effective* authenticator count, or only whether specific top-level flags are false? (A flag-only check misses the "enabled but unusable" case.)
+> * Is there an explicit, off-by-default `disable`/`insecure` flag for intentionally running without auth, distinct from a configuration that merely fails to produce a working authenticator?
+
+---
+
+## GO-AUTH-012: JWT Audience and Issuer Must Be Explicitly Validated
+
+### Severity
+
+High
+
+### Description
+
+Every JWT verification path must set an expected audience (`aud`) and issuer (`iss`) and reject tokens that omit or mismatch them, enforced at the parsing-library level (`jwt.WithAudience`, `jwt.WithIssuer`) rather than trusted as claims to be read and compared manually (or not compared at all). Configuration that enables IDP-based JWT auth must require a non-empty expected audience before the server will start.
+
+### Rationale
+
+A token correctly signed by a trusted IDP but *minted for a different client or service* (a different audience) still passes signature and expiry checks. Without an audience check, any valid token from the same IDP — regardless of which application it was issued for — is accepted as a credential for this service, collapsing the boundary between "this IDP is trusted" and "this specific token was intended for me."
+
+### Non-Compliant Code
+
+```go
+// ERROR: parses and validates signature/expiry, but never checks `aud` against
+// this service's expected audience — any token from the trusted IDP is accepted
+// regardless of which client/service it was actually issued for.
+func VerifyManagementToken(tokenStr string, idpPublicKey interface{}) (*Claims, error) {
+    claims := &Claims{}
+    _, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
+        return idpPublicKey, nil
+    })
+    if err != nil {
+        return nil, err
+    }
+    return claims, nil // claims.Audience is never inspected
+}
+```
+
+### Compliant Code
+
+```go
+// CORRECT: expected audience is required configuration, enforced by the
+// library itself so the check cannot be silently skipped by a future refactor.
+type IDPConfig struct {
+    JWKSURL          string
+    Issuer           string
+    ExpectedAudience string // Required whenever IDP.Enabled == true
+}
+
+func ValidateAuthConfig(cfg AuthConfig) error {
+    if cfg.IDP.Enabled && cfg.IDP.ExpectedAudience == "" {
+        return fmt.Errorf("idp auth is enabled but no expected audience is configured — " +
+            "refusing to start with an unenforceable token scope")
+    }
+    return nil
+}
+
+func VerifyManagementToken(tokenStr string, idpPublicKey interface{}, cfg IDPConfig) (*Claims, error) {
+    claims := &Claims{}
+    _, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
+        return idpPublicKey, nil
+    },
+        jwt.WithAudience(cfg.ExpectedAudience), // Library-enforced — fails closed on mismatch
+        jwt.WithIssuer(cfg.Issuer),
+    )
+    if err != nil {
+        return nil, fmt.Errorf("token verification failed: %w", err)
+    }
+    return claims, nil
+}
+```
+
+> **Verification Checklist before outputting code:**
+> * Does every `jwt.ParseWithClaims`/`jwt.Parse` call for a management or admin-facing token pass `jwt.WithAudience(...)`? (If the `aud` claim exists on the struct but is never checked via a parser option, add it.)
+> * Is the expected audience sourced from required configuration that fails startup validation when IDP auth is enabled but the audience is empty? (If the audience is optional or defaulted silently, make it mandatory per GO-AUTH-011's pattern.)
+> * Is `iss` (issuer) validated the same way? (Add `jwt.WithIssuer` alongside the audience check.)
+
+---
+
+## GO-AUTH-013: Admin, Debug, and Metrics Interfaces Require Real Authentication, Not Merely IP Allowlisting
+
+### Severity
+
+Critical
+
+### Description
+
+Any admin, debug, or metrics HTTP/gRPC endpoint that exposes configuration dumps, runtime state, or sensitive operational data must be protected by the same authentication/authorization stack used for regular management APIs (GO-AUTH-007). An IP allowlist is defense-in-depth only — it must never default to allow-all (`["*"]`), and `Validate()` must reject a wildcard allowlist unless an explicit, off-by-default administrative flag opts into it.
+
+### Rationale
+
+An admin debug endpoint (`config_dump`) or a metrics endpoint reachable with no authentication, gated only by an IP allowlist that defaults to `["*"]`, is functionally unauthenticated from day one of any deployment that didn't override the default. IP-based controls are also routinely defeated inside a Kubernetes cluster (pod-to-pod traffic, a compromised sidecar) where "the caller's IP looks internal" is not evidence the caller is authorized.
+
+### Non-Compliant Code
+
+```go
+// ERROR: config_dump is reachable by anyone whose IP passes an allowlist that
+// defaults to allow-all — no authentication is applied at all.
+func defaultConfig() AdminConfig {
+    return AdminConfig{
+        AllowedIPs: []string{"*"}, // Allow-all by default
+    }
+}
+
+func (s *AdminServer) configDumpHandler(w http.ResponseWriter, r *http.Request) {
+    if !isAllowedIP(r.RemoteAddr, s.cfg.AllowedIPs) {
+        http.Error(w, "Forbidden", http.StatusForbidden)
+        return
+    }
+    json.NewEncoder(w).Encode(s.currentConfig) // No authentication check at all
+}
+```
+
+### Compliant Code
+
+```go
+// CORRECT: real authentication (the same middleware protecting the management
+// API) gates the admin/debug/metrics mux, and the IP allowlist — still present
+// as defense-in-depth — defaults to loopback-only.
+func defaultConfig() AdminConfig {
+    return AdminConfig{
+        AllowedIPs: []string{"127.0.0.1", "::1"}, // Loopback-only default
+    }
+}
+
+func (c AdminConfig) Validate() error {
+    for _, ip := range c.AllowedIPs {
+        if ip == "*" && !c.AllowWildcardIPAllowlist {
+            return fmt.Errorf("admin.allowed_ips=[\"*\"] requires the explicit " +
+                "admin.allow_wildcard_ip_allowlist opt-in flag")
+        }
+    }
+    return nil
+}
+
+func NewAdminMux(cfg AdminConfig, authn Authenticator) http.Handler {
+    mux := http.NewServeMux()
+    mux.HandleFunc("/config_dump", requireScope("admin:config:read", configDumpHandler))
+    mux.HandleFunc("/xds_sync_status", requireScope("admin:xds:read", xdsSyncStatusHandler))
+
+    protected := AuthMiddleware(authn)(mux)          // Real authentication — GO-AUTH-007
+    return ipAllowlistMiddleware(cfg.AllowedIPs)(protected) // IP check as defense-in-depth, not the only check
+}
+```
+
+> **Verification Checklist before outputting code:**
+> * Does an admin/debug/metrics handler rely solely on an IP allowlist with no authentication middleware in front of it? (If yes, wrap it in the same `AuthMiddleware`/`requireScope` stack as management API routes.)
+> * Does the default `AllowedIPs` value include `"*"` or an equivalent allow-all wildcard? (If yes, change the default to loopback-only and require an explicit opt-in flag to widen it.)
+> * Do metrics labels expose high-cardinality, tenant-shaped values (org IDs, API IDs) to an unauthenticated scrape endpoint? (If yes, gate the endpoint the same way, and/or bucket/anonymize the label values.)
+
+---
+
+## GO-AUTH-014: No Default, Hardcoded, or Shipped Credentials
+
+### Severity
+
+Critical
+
+### Description
+
+Packaged/shipped configuration must never contain a functional default username/password (e.g. `admin`/`admin`). Either ship with zero users configured — which, combined with GO-AUTH-011's fail-closed startup validation, forces an operator to provide credentials before the service will run — or generate a random initial credential on first boot, persisted to a file with restrictive permissions, and never leave a static default credential active in a production build.
+
+### Rationale
+
+A shipped `config.toml` containing `username = "admin"` / `password = "admin"` is a credential every installer of the product possesses before they've configured anything; if it is ever left unchanged (a near-certainty across a large install base), it is a direct authentication bypass indistinguishable from no authentication at all.
+
+### Non-Compliant Code
+
+```toml
+# ERROR: functional default credentials shipped in packaged configuration —
+# present in every fresh install until an operator remembers to change them.
+[controller.auth.basic]
+enabled = true
+[[controller.auth.basic.users]]
+username = "admin"
+password = "admin"
+password_hashed = false
+roles = ["admin"]
+```
+
+### Compliant Code
+
+```go
+// CORRECT: on first boot with zero configured users, generate a random
+// credential, persist it restrictively, and never leave a static default
+// active in a production build.
+func EnsureInitialAdminCredential(cfg *BasicAuthConfig, dataDir string) error {
+    if len(cfg.Users) > 0 {
+        return nil // Operator has already configured credentials
+    }
+
+    passwordFile := filepath.Join(dataDir, "initial-admin-password")
+    if _, err := os.Stat(passwordFile); err == nil {
+        return nil // Already generated on a previous boot
+    }
+
+    randomPassword, err := generateSecurePassword(24) // crypto/rand-backed
+    if err != nil {
+        return fmt.Errorf("failed to generate initial admin credential: %w", err)
+    }
+
+    if err := os.WriteFile(passwordFile, []byte(randomPassword), 0o600); err != nil {
+        return fmt.Errorf("failed to persist initial admin credential: %w", err)
+    }
+
+    hashed, err := bcrypt.GenerateFromPassword([]byte(randomPassword), bcrypt.DefaultCost)
+    if err != nil {
+        return fmt.Errorf("failed to hash initial admin credential: %w", err)
+    }
+    cfg.Users = []BasicAuthUser{{Username: "admin", PasswordHash: string(hashed), Roles: []string{"admin"}}}
+
+    log.Warnf("Generated a one-time initial admin password at %s — rotate it after first login.", passwordFile)
+    return nil
+}
+```
+
+> **Verification Checklist before outputting code:**
+> * Does any packaged/shipped config file, Helm chart default, or Dockerfile set a functional (non-placeholder) username and password for an admin or service account? (If yes, remove it — see the two compliant patterns above.)
+> * If a "development mode" flag gates a default credential, is that flag off by default and does the code log a loud, unambiguous warning whenever it is on? (A quiet or easily-forgotten dev flag is equivalent to a shipped default in practice.)
+> * Is a generated initial credential written with `0o600` (or equivalent) permissions and never logged in plaintext to a shared log stream? (Only the file path/existence should be logged, per GO-AUTH-003.)
+
+---
+
+## GO-AUTH-015: Enforce Security Invariants at the Service/Data Layer, Not Only in Route Middleware
+
+### Severity
+
+High
+
+### Description
+
+A cross-cutting invariant that must hold regardless of entry point — e.g. "no mutations while the system is in immutable/maintenance mode" — must be enforced at the lowest common layer every entry point funnels through (typically the service or data-access layer), not solely in HTTP middleware scoped to one route prefix. New entry points (event-driven mutation handlers, an admin server, a future RPC surface) automatically inherit the protection only if it lives below all of them; middleware scoped to `/api/management/v0.9/*` protects only requests that happen to arrive through that specific router.
+
+### Rationale
+
+An immutable-mode lock implemented as middleware in front of one REST router blocked mutations through that router, but Platform-API-driven events and the admin server's own mutation paths reached the same underlying service methods through a different code path — bypassing the lock entirely, because the lock was never present at the point those paths actually converge.
+
+### Non-Compliant Code
+
+```go
+// ERROR: the invariant is checked only in middleware wrapping one specific
+// router. Any mutation path that doesn't traverse this exact middleware chain
+// (an event handler, the admin server, a future gRPC endpoint) bypasses it.
+func ImmutableModeMiddleware(isImmutable func() bool) func(http.Handler) http.Handler {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            if isImmutable() && r.Method != http.MethodGet {
+                http.Error(w, "Locked", http.StatusMethodNotAllowed)
+                return
+            }
+            next.ServeHTTP(w, r)
+        })
+    }
+}
+mux.Handle("/api/management/v0.9/", ImmutableModeMiddleware(cfg.IsImmutable)(managementRouter))
+// Platform-API event handler and admin server call restAPIService.Update directly —
+// neither passes through this middleware.
+```
+
+### Compliant Code
+
+```go
+// CORRECT: the check lives inside the service method itself — the one place
+// every caller (REST, WSS/Platform-API events, admin server, future RPC)
+// necessarily passes through before a mutation can occur.
+type RestAPIService struct {
+    db          *sql.DB
+    isImmutable func() bool
+}
+
+func (s *RestAPIService) Update(ctx context.Context, apiID string, def APIDefinition) error {
+    if s.isImmutable() {
+        return ErrImmutableModeActive // One check protects every entry point
+    }
+    return s.db.UpdateAPI(ctx, apiID, def)
+}
+
+// Middleware may still exist for a fast HTTP-layer rejection (better UX/latency),
+// but it is defense-in-depth on top of the service-layer check, never a substitute for it.
+```
+
+> **Verification Checklist before outputting code:**
+> * Is a security invariant (immutable mode, a maintenance lock, a tenant-suspension check) implemented only as route middleware scoped to one router or path prefix? (If yes, move the authoritative check into the service/data layer method(s) that perform the actual mutation.)
+> * Are there multiple ways to reach the same mutation (HTTP handler, event/webhook consumer, admin server, background job)? (Enumerate them and confirm the invariant check is reachable from every one, not just the primary HTTP path.)
+
+---
+
+## GO-AUTH-016: Verify Server/Peer-Asserted Identity Against Locally-Known Configuration
+
+### Severity
+
+Medium
+
+### Description
+
+When a remote peer (a control plane, an upstream gateway) asserts its own identity or a configuration value back to you over an already-established channel (e.g. an `ack` message echoing a `gateway_id`), compare that asserted value against what you independently expect or hold locally before trusting it. An authenticated transport proves who signed the connection; it does not prove that every value inside the payload is self-consistent with what you expect — a compromised or misconfigured peer can still assert an unexpected value over a channel it legitimately authenticated to.
+
+### Rationale
+
+A control-plane `connection.ack` response carried a server-assigned `gateway_id` that was stored and used without ever being compared to the `gateway_id` this instance was actually configured with. A hostile or misconfigured control plane could assign an unexpected identity that the gateway would then silently adopt, creating an identity-confusion condition between what the operator configured and what the gateway believes about itself.
+
+### Non-Compliant Code
+
+```go
+// ERROR: accepts the server-asserted gateway_id with no comparison to the
+// locally configured value — the connection being authenticated says nothing
+// about whether this specific field is what was expected.
+func (c *ControlPlaneClient) handleConnectionAck(ack *ConnectionAck) {
+    c.assignedGatewayID = ack.GatewayID // Trusted without verification
+}
+```
+
+### Compliant Code
+
+```go
+// CORRECT: the server-asserted value is checked against the locally configured
+// identity before being accepted; a mismatch is treated as a security-relevant
+// event and fails closed rather than silently adopting the asserted value.
+func (c *ControlPlaneClient) handleConnectionAck(ack *ConnectionAck) error {
+    if ack.GatewayID != c.gatewayID {
+        logger.Error("control plane asserted an unexpected gateway_id",
+            "expected", c.gatewayID, "asserted", ack.GatewayID)
+        return fmt.Errorf("gateway_id mismatch from control plane — refusing to proceed")
+    }
+    return nil
+}
+
+// Caller treats this as a permanent failure — hard-exit rather than continuing
+// with an unverified identity, since continuing risks operating under a
+// silently-swapped identity for the lifetime of the connection.
+if err := client.handleConnectionAck(ack); err != nil {
+    log.Fatalf("fatal: %v", err)
+}
+```
+
+> **Verification Checklist before outputting code:**
+> * Does code accept an identity, ID, or configuration value asserted by a remote peer and use it without comparing it to a locally-held expectation? (If yes, add the comparison and fail closed on mismatch.)
+> * Is a mismatch treated as a security event (logged distinctly, process exits or refuses to proceed) rather than silently overwritten or ignored? (An identity mismatch from an authenticated peer is more suspicious than a mismatch from an unauthenticated one — the peer had to get *something* right to reach this point.)
+
+---
+
+## GO-AUTH-017: Security-Relevant Route Matching Must Use Structural Route Identity, Not Heuristic String Matching
+
+### Severity
+
+High
+
+### Description
+
+Middleware or policy code that decides *whether* authentication/authorization applies to a request must key that decision off the route's actual registered binding or policy attachment — a structural match against the router/policy configuration — never a heuristic like "`method == POST` and the path contains the substring `mcp`". A heuristic predicate has false negatives for any request shape its author didn't anticipate, and those negatives silently *skip* the security check entirely rather than degrading gracefully or erroring.
+
+### Rationale
+
+MCP auth/authz/ACL gates were implemented as `r.Method == "POST" && strings.Contains(r.URL.Path, "mcp")`. Any legitimate protocol variation the heuristic didn't anticipate — a non-POST JSON-RPC transport, or a route whose path doesn't happen to contain the literal substring `"mcp"` — bypassed authentication and authorization entirely, with no error or log signal that anything had been skipped.
+
+### Non-Compliant Code
+
+```go
+// ERROR: whether auth applies is decided by a request-shape heuristic. Any
+// request that doesn't match this exact shape skips auth/authz entirely,
+// silently, with no indication that a check was bypassed.
+func MCPAuthMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "mcp") {
+            if !isAuthenticated(r) {
+                http.Error(w, "Forbidden", http.StatusForbidden)
+                return
+            }
+        }
+        next.ServeHTTP(w, r) // Any other method/path combination — no check at all
+    })
+}
+```
+
+### Compliant Code
+
+```go
+// CORRECT: the decision is keyed off the route's actual registered binding —
+// resolved from router/policy configuration — not a guess about request shape.
+// A request that is in-scope for MCP handling but doesn't parse into the
+// expected structural shape is a failure to be denied, not a check to skip.
+type RouteBinding struct {
+    Kind         string // "mcp", "rest", "llm-proxy", ...
+    RequiresAuth bool
+}
+
+func ResolveRouteBinding(r *http.Request, router *Router) (RouteBinding, error) {
+    binding, ok := router.Match(r) // Structural match against registered routes
+    if !ok {
+        return RouteBinding{}, fmt.Errorf("no registered route binding for this request")
+    }
+    return binding, nil
+}
+
+func AuthMiddleware(router *Router, next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        binding, err := ResolveRouteBinding(r, router)
+        if err != nil {
+            // Unresolvable route shape in a space that requires auth — deny, don't pass through.
+            http.Error(w, "Forbidden", http.StatusForbidden)
+            return
+        }
+        if binding.RequiresAuth && !isAuthenticated(r) {
+            http.Error(w, "Forbidden", http.StatusForbidden)
+            return
+        }
+        next.ServeHTTP(w, r)
+    })
+}
+```
+
+> **Verification Checklist before outputting code:**
+> * Does a security gate (auth, authz, ACL) decide whether it applies based on `r.Method`/`strings.Contains(r.URL.Path, ...)` or similar request-shape heuristics, rather than a structural match against registered routes/policy bindings? (If yes, replace with a resolution against the actual routing/policy configuration.)
+> * Is the predicate used consistently across every middleware in the same protection chain (e.g. auth, authz, and ACL for the same feature)? (Divergent heuristics across sibling middlewares — even if each looks reasonable alone — can each miss a different edge case, compounding the gap.)
+> * When a request is in a security-sensitive namespace but fails to match the expected structural shape, does the code deny by default rather than silently continuing? (An unrecognized shape must be treated as untrusted, not as "not applicable.")
+
+---
+
+## GO-AUTH-018: Fail-Closed on Security-Critical File and Socket Permission Checks
+
+### Severity
+
+High
+
+### Description
+
+When code checks the permission bits of a security-critical file or Unix domain socket (a master encryption key, a private key, an IPC socket used for privileged control), a too-permissive result must cause the operation to fail — return an error, abort startup — not merely log a warning and continue. Relying on the process umask for a newly created Unix domain socket is equivalent to not checking permissions at all, since the umask is rarely tuned specifically for that socket.
+
+### Rationale
+
+An AES master-key file with overly permissive bits triggered only a warning log line before the key was loaded and used anyway; a newly created Unix domain socket relied entirely on the ambient umask (commonly resulting in a world-readable socket) with no explicit `chmod` and no verification step at all. In both cases, the code *detected* (or could trivially have detected) a permission problem on security-critical material and proceeded regardless.
+
+### Non-Compliant Code
+
+```go
+// ERROR: detects an overly permissive key file but only warns — the key is
+// still loaded and used.
+func LoadMasterKey(path string) ([]byte, error) {
+    info, err := os.Stat(path)
+    if err != nil {
+        return nil, err
+    }
+    if info.Mode().Perm()&0o077 != 0 {
+        log.Warnf("key file %s has overly permissive permissions %o", path, info.Mode().Perm())
+    }
+    return os.ReadFile(path) // Proceeds regardless
+}
+```
+
+```python
+# ERROR: Unix domain socket created with no explicit chmod — relies on the
+# ambient umask, which is typically 022 (world-readable/executable).
+server.add_insecure_port(f"unix://{socket_path}")
+server.start()
+```
+
+### Compliant Code
+
+```go
+// CORRECT: an overly permissive key file is a hard failure, not a warning,
+// with a narrowly-scoped, off-by-default development opt-out.
+func LoadMasterKey(path string, devMode bool) ([]byte, error) {
+    info, err := os.Stat(path)
+    if err != nil {
+        return nil, err
+    }
+    if info.Mode().Perm()&0o077 != 0 {
+        if !devMode {
+            return nil, fmt.Errorf("key file %s permissions %o are too permissive — refusing to load",
+                path, info.Mode().Perm())
+        }
+        log.Warnf("DEVELOPMENT MODE: loading key file %s despite permissive permissions %o", path, info.Mode().Perm())
+    }
+    return os.ReadFile(path)
+}
+```
+
+```python
+# CORRECT: explicit chmod immediately after socket creation; abort startup if
+# it cannot be applied — never fall back to umask defaults for privileged IPC.
+server.add_insecure_port(f"unix://{socket_path}")
+try:
+    os.chmod(socket_path, 0o660)
+except OSError as e:
+    logger.error("Failed to set socket permissions on %s: %s", socket_path, e)
+    raise  # Abort startup — do not serve on a socket with unverified permissions
+server.start()
+```
+
+> **Verification Checklist before outputting code:**
+> * Does a permission check on a security-critical file or socket log a warning but still proceed when the check fails? (If yes, make it a hard failure, with at most a narrowly-scoped, off-by-default dev opt-out.)
+> * Is a newly created Unix domain socket explicitly `chmod`'d to a restrictive mode immediately after creation, with startup aborted if the `chmod` fails? (Relying on the ambient umask is not a check.)
+> * Is the permission check re-verified periodically at runtime for long-lived processes, or only once at startup? (A file's permissions can change after a process has already loaded it — consider a periodic re-check for high-value key material.)

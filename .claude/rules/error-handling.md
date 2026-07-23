@@ -37,6 +37,11 @@ Apply this rule whenever writing, refactoring, or reviewing Go (`.go`) code resp
 
 * *Note:* Internal logs can log the specific reason (e.g., "token expired") for debugging, but the HTTP response writer must remain completely generic to prevent credential probing.
 
+### 5. Secret and Sensitive-Handle Non-Disclosure
+
+* **Never Echo a Secret/Resource Handle Back on Resolution Failure:** An error path that fails to resolve a secret, key, credential, or similarly sensitive handle must not include that handle — or any substring of it — in the client-facing response body, even though the handle is not the secret's *value*. A handle is frequently sufficient to confirm the existence (or non-existence) of a specific tenant's resource, which is an enumeration primitive in its own right, and can be correlated with other leaked data. Log the full handle server-side, for forensics only, via the standard internal-error logging path.
+* **Uniform Response Shape for Present-vs-Absent Resources:** Where practical, make the client-facing failure response — and its approximate latency — the same whether a referenced secret/resource exists but failed to resolve for an internal reason, or does not exist at all. This is the same unified-response principle as Directive 4 (constant-response auth failures), applied to any resource-existence-sensitive lookup, not only login.
+
 ---
 
 ## Code Examples for Enforcement
@@ -60,6 +65,16 @@ func HandleLogin(w http.ResponseWriter, r *http.Request) {
         w.WriteHeader(http.StatusNotFound)
         json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
         return
+    }
+}
+
+// BAD: secret-resolution failure echoes the secret handle back to the caller —
+// an enumeration primitive even though the secret's value itself isn't leaked.
+func HandleTemplateSecretResolution(w http.ResponseWriter, handle string, err error) {
+    if err != nil {
+        json.NewEncoder(w).Encode(map[string]string{
+            "error": fmt.Sprintf("failed to resolve secret %q: %v", handle, err),
+        })
     }
 }
 
@@ -91,6 +106,21 @@ func HandleLogin(w http.ResponseWriter, r *http.Request) {
     }
 }
 
+// GOOD: the secret handle is logged internally for forensics, but the
+// client-facing response is sterile — identical in shape whether the handle
+// doesn't exist or exists but failed to resolve for another reason.
+func HandleTemplateSecretResolution(ctx context.Context, w http.ResponseWriter, handle string, err error) {
+    if err != nil {
+        logger.LogInternalError(ctx, "secret resolution failed for handle %q: %v", handle, err)
+        w.WriteHeader(http.StatusUnprocessableEntity)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error":   "resolution_failed",
+            "message": "The referenced secret could not be resolved.", // No handle, no distinction by cause
+        })
+        return
+    }
+}
+
 ```
 
 ---
@@ -99,5 +129,5 @@ func HandleLogin(w http.ResponseWriter, r *http.Request) {
 > * Does this error message reveal *why* the auth failed to the client? (If yes, make it generic).
 > * Does the generated ID contain hardcoded source markers? (If yes, use a random crypto string/UUID).
 > * Are there any `X-Amz` or similar infrastructure headers bleeding through? (If yes, strip them).
+> * Does any client-facing error response include a secret handle, key identifier, or other sensitive resource reference — even without the underlying secret value? (If yes, strip it from the response body and log it server-side only.)
 > 
->
